@@ -53,7 +53,7 @@ class OllamaProvider(BaseLLMProvider):
             "options": {
                 "temperature": 0.2,
                 "top_p": 0.9,
-                "num_predict": 450,
+                "num_predict": 800,
             }
         }
         if tools:

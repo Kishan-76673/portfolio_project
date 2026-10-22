@@ -3,19 +3,24 @@ from typing import AsyncGenerator, Dict, Any, List
 from app.services.llm.base import BaseLLMProvider, ChatMessage, StreamChunk
 from app.services.rag.vector_store import ChromaVectorStore
 from app.services.agent.tools.live_demo import LiveDemoVerifierTool
+from app.core.config import get_settings
 
-SYSTEM_GROUNDING_PROMPT = """
-You are the AI Career Assistant for Robin's professional portfolio website.
-Your role is to assist recruiters, engineering managers, and technical interviewers by providing accurate, grounded information about Robin.
+SYSTEM_GROUNDING_PROMPT_TEMPLATE = """
+You are an AI Career Assistant for {name}'s professional portfolio website.
+Your ONLY job is to answer questions about {name} using the resume context provided to you.
 
-CRITICAL GROUNDING RULES:
-1. Answer ONLY using the facts from the provided <verified_knowledge> section or tool outputs.
-2. If the user asks about a technology, company, credential, or experience NOT mentioned in the context:
-   Do NOT invent or extrapolate. State clearly:
-   "I don't have enough information in Robin's portfolio knowledge base to answer that accurately."
-3. DO NOT hallucinate, invent previous employers, degrees, or years of experience.
-4. Keep answers professional, concise, and structured with bullet points where appropriate.
-5. If the user asks whether a project demo is live or working, call the `verify_live_demo` tool.
+ABSOLUTE RULES — follow these without exception:
+1. SOURCE OF TRUTH: The [PORTFOLIO CONTEXT] in each user message is your ONLY source of information.
+   Never use your own training knowledge about what {name} might know. If it's not in the context, you don't know it.
+2. NAME: Always refer to the portfolio owner as "{name}". Never use any other name (not Robin, not Raza, not "the candidate").
+3. NO HALLUCINATION: Do NOT invent technologies, job titles, companies, dates, projects, skills, or achievements.
+   If something is not explicitly mentioned in the context, say: "{name}'s resume does not mention that."
+4. NATURAL TONE: Answer in first-person-about-third-person style. Be concise, polished, and professional.
+   Do NOT start with phrases like "According to the context" or "Based on the provided information".
+5. FORMATTING: No markdown bold (**text**). Use plain text and simple bullet points (-) only.
+6. LENGTH: Keep responses under 150 words. Be direct. Recruiters are busy.
+7. OUTDATED INFO: If asked about something that may have changed (e.g. current role), note that the resume
+   reflects the most recently uploaded version and may not capture the very latest updates.
 """
 
 class AgentOrchestrator:
@@ -26,6 +31,15 @@ class AgentOrchestrator:
         self.vector_store = vector_store
         self.live_tool = LiveDemoVerifierTool()
         self.tools = [self.live_tool]
+        # Resolve owner name at instance creation time (safe from hot-reload cache issues)
+        try:
+            self._owner_name = get_settings().PORTFOLIO_OWNER_NAME
+        except Exception:
+            self._owner_name = "Kishan"
+
+    @property
+    def owner_name(self) -> str:
+        return self._owner_name
 
     async def run_stream(
         self,
@@ -35,10 +49,11 @@ class AgentOrchestrator:
         # 1. Retrieve RAG context from verified knowledge base
         retrieved_chunks = await self.vector_store.search(user_message, self.llm, top_k=3)
         context_str = "\n\n---\n\n".join([c["content"] for c in retrieved_chunks])
+        name = self.owner_name
         if not context_str:
-            context_str = "No specific context retrieved. Rely only on general professional summary."
+            context_str = f"No resume content found. The resume PDF may not have been indexed yet."
 
-        system_instruction = f"{SYSTEM_GROUNDING_PROMPT}\n\n<verified_knowledge>\n{context_str}\n</verified_knowledge>"
+        system_instruction = SYSTEM_GROUNDING_PROMPT_TEMPLATE.format(name=name)
 
         # Smart tool gating: only pass tool schemas if user asks about live demo / deployment status
         demo_keywords = {"live", "demo", "deploy", "deployed", "online", "up", "working", "status", "verify", "health"}
@@ -46,7 +61,19 @@ class AgentOrchestrator:
         should_use_tools = any(kw in user_lower for kw in demo_keywords)
         tool_schemas = [t.get_schema() for t in self.tools] if should_use_tools else None
 
-        messages = history + [ChatMessage(role="user", content=user_message)]
+        # Anchor context directly in the active user turn so local 1B models pay full attention to it
+        prompt_with_context = (
+            f"[PORTFOLIO CONTEXT — {name.upper()}'s RESUME]\n"
+            f"{context_str}\n\n"
+            f"---\n"
+            f"Recruiter Question: {user_message}\n\n"
+            f"INSTRUCTION: Answer using ONLY the resume context above. "
+            f"Refer to the owner as '{name}'. "
+            f"If the answer is not in the context, say '{name}\'s resume does not mention that.' "
+            f"Do not use any outside knowledge. Keep it under 150 words."
+        )
+
+        messages = history + [ChatMessage(role="user", content=prompt_with_context)]
 
         # 2. First pass: Call LLM with tools only when relevant
         pending_tool_call = None

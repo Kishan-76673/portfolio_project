@@ -6,10 +6,25 @@ from app.services.rag.chunker import DocumentChunker
 from app.services.llm.base import BaseLLMProvider
 
 STOPWORDS = {
-    "a", "an", "the", "and", "or", "in", "on", "at", "to", "for", "with", "by", 
+    "a", "an", "the", "and", "or", "in", "on", "at", "to", "for", "with", "by",
     "is", "are", "was", "were", "be", "been", "of", "what", "who", "where", "how",
-    "tell", "me", "about", "show", "can", "you", "does", "have", "has", "do"
+    "tell", "me", "about", "show", "can", "you", "does", "have", "has", "do",
+    "briefly", "give", "list", "describe", "explain", "your", "his", "her", "its"
 }
+
+# Maps query intent keywords → preferred chunk category → score boost
+INTENT_ROUTING = [
+    # (query_keywords, target_category, boost)
+    (["experience", "work", "job", "role", "position", "employ", "company", "companies",
+      "responsibility", "responsibilities", "past", "previous", "career"], "experience", 25.0),
+    (["skill", "skills", "technology", "technologies", "tech", "stack", "tool", "tools",
+      "know", "language", "framework", "proficient", "expertise", "competenc"], "skills", 25.0),
+    (["project", "projects", "built", "build", "developed", "portfolio", "github"], "project", 25.0),
+    (["education", "degree", "university", "college", "study", "studied", "graduate",
+      "graduation", "gpa", "cgpa", "academic", "course", "qualification"], "education", 25.0),
+    (["summary", "profile", "about", "overview", "who", "introduce", "background",
+      "tell me about"], "general", 15.0),
+]
 
 class ChromaVectorStore:
     """High-speed Hybrid Vector & Semantic Retrieval Store for portfolio documents."""
@@ -35,10 +50,20 @@ class ChromaVectorStore:
         except Exception as e:
             print(f"[VectorStore] ChromaDB disk backend deferred: {e}")
 
+    def _check_for_updates(self):
+        """Auto-detects if any .md or .pdf files were added or modified in raw_dir."""
+        current_files = glob.glob(os.path.join(self.raw_dir, "*.md")) + glob.glob(os.path.join(self.raw_dir, "*.pdf"))
+        mod_times = tuple((f, os.path.getmtime(f)) for f in sorted(current_files) if os.path.exists(f))
+        if mod_times != getattr(self, "_cached_mod_times", None):
+            self._cached_mod_times = mod_times
+            self._load_local_chunks()
+
     def _load_local_chunks(self):
-        """Loads and indexes markdown files into fast in-memory cache."""
-        md_files = glob.glob(os.path.join(self.raw_dir, "*.md"))
+        """Loads and indexes both markdown and PDF files into fast in-memory cache."""
         loaded = []
+
+        # 1. Load Markdown files
+        md_files = glob.glob(os.path.join(self.raw_dir, "*.md"))
         for fpath in md_files:
             fname = os.path.basename(fpath)
             try:
@@ -47,12 +72,36 @@ class ChromaVectorStore:
                 file_chunks = DocumentChunker.chunk_markdown(content, fname)
                 loaded.extend(file_chunks)
             except Exception as e:
-                print(f"[VectorStore Warning] Could not load {fname}: {e}")
+                print(f"[VectorStore Warning] Could not load markdown {fname}: {e}")
+
+        # 2. Load PDF files
+        pdf_files = glob.glob(os.path.join(self.raw_dir, "*.pdf"))
+        for fpath in pdf_files:
+            fname = os.path.basename(fpath)
+            try:
+                pdf_chunks = DocumentChunker.chunk_pdf(fpath, fname)
+                loaded.extend(pdf_chunks)
+                if pdf_chunks:
+                    print(f"[VectorStore] Indexed {len(pdf_chunks)} chunks from PDF '{fname}'")
+            except Exception as e:
+                print(f"[VectorStore Warning] Could not load PDF '{fname}': {e}")
 
         self.chunks = loaded
 
+    def get_loaded_documents(self) -> List[Dict[str, Any]]:
+        """Returns summary of all currently indexed markdown and PDF documents."""
+        self._check_for_updates()
+        docs_summary: Dict[str, int] = {}
+        for c in self.chunks:
+            src = c.get("metadata", {}).get("source", "unknown")
+            docs_summary[src] = docs_summary.get(src, 0) + 1
+        return [
+            {"filename": fname, "chunks": count, "type": "pdf" if fname.lower().endswith(".pdf") else "markdown"}
+            for fname, count in docs_summary.items()
+        ]
+
     async def build_index(self, llm_provider: BaseLLMProvider):
-        """Indexes all markdown files into memory and optionally into ChromaDB."""
+        """Indexes all markdown and PDF files into memory and optionally into ChromaDB."""
         self._load_local_chunks()
 
         # If ChromaDB collection already has data, avoid expensive re-embedding
@@ -90,16 +139,26 @@ class ChromaVectorStore:
             print(f"[VectorStore] ChromaDB vector indexing skipped: {e}")
 
     async def search(self, query: str, llm_provider: BaseLLMProvider, top_k: int = 3, category: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Ultra-fast hybrid semantic retrieval (< 0.2ms) with Chroma vector fallback."""
-        if not self.chunks:
-            self._load_local_chunks()
+        """Intent-aware hybrid retrieval: routes query to correct resume section first."""
+        self._check_for_updates()
 
         if not self.chunks:
             return []
 
-        # 1. Fast in-memory token & semantic scoring
+        q_lower = query.lower()
+
+        # 1. Detect query intent — which resume section is being asked about?
+        intent_category: Optional[str] = None
+        intent_boost: float = 0.0
+        for keywords, cat, boost in INTENT_ROUTING:
+            if any(kw in q_lower for kw in keywords):
+                if intent_category is None or boost > intent_boost:
+                    intent_category = cat
+                    intent_boost = boost
+
+        # 2. Build query terms (minus stopwords)
         query_terms = [
-            t for t in re.findall(r'\b[a-zA-Z0-9_\-]+\b', query.lower()) 
+            t for t in re.findall(r'\b[a-zA-Z0-9_\-]+\b', q_lower)
             if t not in STOPWORDS and len(t) > 1
         ]
 
@@ -111,35 +170,28 @@ class ChromaVectorStore:
             text_lower = c.get("text", "").lower()
             cat = meta.get("category", "")
 
-            # Filter if explicit category requested
+            # Hard filter if explicit category override provided
             if category and cat != category:
                 continue
 
-            # Header match is high signal
+            # Intent-based category boost — primary routing signal
+            if intent_category and cat == intent_category:
+                score += intent_boost
+
+            # Header keyword match (very high signal — section headers are precise)
             for term in query_terms:
                 if term in header:
-                    score += 15.0
+                    score += 18.0
                 if term in text_lower:
-                    # Count term occurrences with diminishing returns
                     count = text_lower.count(term)
-                    score += min(count * 2.0, 10.0)
-
-            # Category boost
-            if "project" in query.lower() and cat == "project":
-                score += 5.0
-            elif "experience" in query.lower() and cat == "experience":
-                score += 5.0
-            elif ("skill" in query.lower() or "tech" in query.lower()) and cat == "skills":
-                score += 5.0
-            elif "education" in query.lower() and cat == "education":
-                score += 5.0
+                    score += min(count * 2.0, 12.0)
 
             scored_chunks.append((score, c))
 
-        # Sort by relevance score descending
+        # Sort by score descending
         scored_chunks.sort(key=lambda x: x[0], reverse=True)
 
-        # Select top candidates
+        # Return top_k — always return at least something even if score is 0
         top_candidates = [item[1] for item in scored_chunks[:top_k]]
         return [{"content": c["text"], "metadata": c["metadata"]} for c in top_candidates]
 

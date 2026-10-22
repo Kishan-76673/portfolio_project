@@ -7,6 +7,9 @@ class Settings(BaseSettings):
     PORT: int = 8001
     DEBUG: bool = True
 
+    # Portfolio Owner Name (override via .env → PORTFOLIO_OWNER_NAME=YourName)
+    PORTFOLIO_OWNER_NAME: str = "Kishan"
+
     # LLM Settings
     LLM_PROVIDER: str = "ollama"  # "ollama" or "gemini"
     

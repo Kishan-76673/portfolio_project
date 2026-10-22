@@ -15,7 +15,7 @@ export const App: React.FC = () => {
     {
       role: 'assistant',
       content:
-        "Hi, I'm Robin's portfolio assistant. Just ask to see recent work, work by industry, role, or whatever you'd like. You're also welcome to ask questions about my skills and interests.",
+        "Hi, I'm Kishan's portfolio assistant. Feel free to ask about his work experience, skills, projects, or anything from his resume.",
       time: '4:42 AM',
     },
   ]);
@@ -37,10 +37,10 @@ export const App: React.FC = () => {
     }
 
     // Initialize or restore session ID from localStorage
-    let sId = localStorage.getItem('robin_portfolio_session');
+    let sId = localStorage.getItem('kishan_portfolio_session');
     if (!sId) {
       sId = 'recruiter_' + Math.random().toString(36).substring(2, 11);
-      localStorage.setItem('robin_portfolio_session', sId);
+      localStorage.setItem('kishan_portfolio_session', sId);
     }
     setSessionId(sId);
   }, []);
@@ -97,6 +97,7 @@ export const App: React.FC = () => {
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
+      let accumulatedReply = '';
 
       while (true) {
         const { value, done } = await reader.read();
@@ -126,13 +127,17 @@ export const App: React.FC = () => {
             try {
               const data = JSON.parse(rawData);
               if (data.delta) {
+                accumulatedReply += data.delta;
+                const currentText = accumulatedReply;
                 setMessages((prev) => {
-                  const updated = [...prev];
-                  const last = updated[updated.length - 1];
-                  if (last && last.role === 'assistant') {
-                    last.content += data.delta;
-                  }
-                  return updated;
+                  const lastIndex = prev.length - 1;
+                  if (lastIndex < 0) return prev;
+                  const last = prev[lastIndex];
+                  if (last.role !== 'assistant') return prev;
+                  return [
+                    ...prev.slice(0, lastIndex),
+                    { ...last, content: currentText },
+                  ];
                 });
               }
             } catch {
@@ -163,6 +168,34 @@ export const App: React.FC = () => {
     { label: "What's been on your mind lately?", icon: '💬', query: 'Explain Robin’s focus in AI/ML and backend systems' },
     { label: 'Explain the ATS project', icon: '⚡', query: 'Explain the ATS/Resume Screening project and its architecture' },
   ];
+
+  const renderFormattedContent = (content: string) => {
+    if (!content) return null;
+    // Automatically strip robotic opening prefixes if generated
+    const cleaned = content
+      .replace(/^According to Robin['’]?s verified knowledge,?\s*:?/i, '')
+      .replace(/^Based on Robin['’]?s verified knowledge,?\s*:?/i, '')
+      .trim();
+
+    const lines = cleaned.split('\n');
+    return lines.map((line, lineIdx) => {
+      // Parse markdown bold **text** into clean HTML <strong> without raw asterisks
+      const parts = line.split(/(\*\*[^*]+\*\*)/g);
+      const elements = parts.map((part, pIdx) => {
+        if (part.startsWith('**') && part.endsWith('**')) {
+          return <strong key={pIdx}>{part.slice(2, -2)}</strong>;
+        }
+        return part;
+      });
+
+      return (
+        <React.Fragment key={lineIdx}>
+          {elements}
+          {lineIdx < lines.length - 1 && <br />}
+        </React.Fragment>
+      );
+    });
+  };
 
   return (
     <div className="portfolio-layout">
@@ -204,7 +237,7 @@ export const App: React.FC = () => {
       {/* Right Column: Chat Stream & Top Bar */}
       <main className="chat-col">
         <header className="top-bar">
-          <span className="top-tag">ROBIN / DESIGN & ENGINEERING</span>
+          <span className="top-tag">KISHAN / SOFTWARE DEVELOPMENT & AI</span>
         </header>
 
         <div className="messages-scroll">
@@ -212,7 +245,7 @@ export const App: React.FC = () => {
             <div key={index} className={`msg-block ${m.role}`}>
               <div className="msg-text">
                 {m.content ? (
-                  m.content
+                  renderFormattedContent(m.content)
                 ) : isStreaming && index === messages.length - 1 ? (
                   <span className="thinking-badge">
                     <span className="pulse-dot"></span>
